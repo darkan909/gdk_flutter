@@ -1,10 +1,9 @@
 use serde_json::Value;
 use gdk_electrum::{ElectrumSession, NativeNotif};
-use gdk_common::session::Session;
-use gdk_common::wally::{make_str, read_str};
+use gdk_common::wally::{make_str, read_str, bip39_mnemonic_to_seed};
 use std::ffi::CString;
 use std::os::raw::c_char;
-use gdk_common::Network;
+use gdk_common::network::NetworkParameters;
 use std::string::String;
 use gdk_common::error::Error;
 use  std::ffi;
@@ -19,11 +18,13 @@ pub fn init() -> Result<(ElectrumSession), anyhow::Error> {
     let mne = generate_mnemonic12_from_rng(&mut rng);
     println!("{:?}", mne);
     let mut session = create_session();
-    println!("session");
-    //session.connect(&serde_json::Value::Null).unwrap();
+    session.connect(&serde_json::Value::Null).unwrap();
     let mnemonic = gdk_common::mnemonic::Mnemonic::from(mne.to_owned());
-    println!("{:?}", mnemonic);
-    let login_data = session.login(&mnemonic, None);
+    println!("{:?}", &mnemonic);
+    let login_data = session.login(&mnemonic, None).unwrap();
+    println!("{:?}", login_data);
+    //let c = "";
+    //bip39_mnemonic_to_seed(&mne, &c);
     return Ok(session);
 }
 
@@ -43,7 +44,7 @@ fn create_session() -> ElectrumSession{
     
     println!("{:?}", read_str(c_str.as_ptr()));
 
-    let network: Network = gdk_common::Network {
+    let network: NetworkParameters = gdk_common::network::NetworkParameters {
         name: "testnet".to_string(),
         network: "electrum-testnet-liquid".to_owned(),
         development: false,
@@ -53,6 +54,7 @@ fn create_session() -> ElectrumSession{
         address_explorer_url:  "https://blockstream.info/liquidtestnet/address/".to_string(),
         electrum_tls: Some(true),
         electrum_url:  Some("blockstream.info:465".to_string()),
+        electrum_onion_url: Some("".to_string()),
         validate_domain: Some(false),
         policy_asset: Some("144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49".to_string()),
         sync_interval: None,
@@ -64,11 +66,18 @@ fn create_session() -> ElectrumSession{
         asset_registry_onion_url: None,
         spv_multi: Some(false),
         spv_servers: None,
-        taproot_enabled_at: Some(0xffffffff),
+        max_reorg_blocks : None,
+        pin_server_onion_url: "".to_string(),
+        pin_server_public_key: "".to_string(),
+        pin_server_url:"".to_string(),
+        use_tor:Some(false),
+        proxy: Some("".to_string()),
+        state_dir:"".to_string()
+        //taproot_enabled_at: Some(0xffffffff),
     };
     let url = ElectrumUrl::Plaintext("blockstream.info:465".to_string());
     println!("{:?}", url);
-    let mut session = ElectrumSession::create_session(network, "", None, url);
+    let mut session = ElectrumSession::create_session(network, None, url);
     println!("balbal");
     return session
 }

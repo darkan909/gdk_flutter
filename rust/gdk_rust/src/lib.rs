@@ -11,10 +11,6 @@ use crate::serialize::*;
 use gdk_common::wally::{make_str, read_str};
 use serde_json::Value;
 
-#[cfg(feature = "android_log")]
-use android_logger::{Config, FilterBuilder};
-#[cfg(feature = "android_log")]
-use log::Level;
 use std::ffi::CString;
 use std::fmt;
 use std::os::raw::c_char;
@@ -22,14 +18,16 @@ use std::sync::Once;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gdk_common::model::{
-    CreateAccountOpt, GetNextAccountOpt, GetTransactionsOpt, RenameAccountOpt, SPVVerifyTx,
-    SetAccountHiddenOpt, UpdateAccountOpt,
+    CreateAccountOpt, GetNextAccountOpt, GetTransactionsOpt, InitParam, RenameAccountOpt,
+    SPVDownloadHeadersParams, SPVVerifyTxParams, SetAccountHiddenOpt, UpdateAccountOpt,
 };
-use gdk_common::session::Session;
 
 use crate::error::Error;
-use gdk_electrum::{ElectrumSession, NativeNotif};
+use gdk_electrum::error::Error as ElectrumError;
+use gdk_electrum::pset::{self, ExtractTxParam, FromTxParam, MergeTxParam};
+use gdk_electrum::{determine_electrum_url, headers, ElectrumSession};
 use log::{LevelFilter, Metadata, Record};
+use serde::Serialize;
 use std::str::FromStr;
 
 pub const GA_OK: i32 = 0;
@@ -58,7 +56,6 @@ pub extern "C" fn GDKRUST_create_session(
     ret: *mut *const libc::c_void,
     network: *const c_char,
 ) -> i32 {
-    const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Off;
     let network: Value = match serde_json::from_str(&read_str(network)) {
         Ok(x) => x,
         Err(err) => {
@@ -66,16 +63,6 @@ pub extern "C" fn GDKRUST_create_session(
             return GA_ERROR;
         }
     };
-    let level = if network.is_object() {
-        match network.as_object().unwrap().get("log_level") {
-            Some(Value::String(val)) => LevelFilter::from_str(val).unwrap_or(DEFAULT_LOG_LEVEL),
-            _ => DEFAULT_LOG_LEVEL,
-        }
-    } else {
-        DEFAULT_LOG_LEVEL
-    };
-    init_logging(level);
-    debug!("init logging");
 
     match create_session(&network) {
         Err(err) => {
@@ -95,16 +82,20 @@ pub extern "C" fn GDKRUST_create_session(
 /// Initialize the logging framework.
 /// Note that once initialized it cannot be changed, only by reloading the library.
 fn init_logging(level: LevelFilter) {
-    #[cfg(feature = "android_log")]
+    #[cfg(target_os = "android")]
     INIT_LOGGER.call_once(|| {
         android_logger::init_once(
-            Config::default().with_min_level(level.to_level().unwrap_or(Level::Error)).with_filter(
-                FilterBuilder::new().parse("warn,gdk_rust=debug,gdk_electrum=debug").build(),
-            ),
+            android_logger::Config::default()
+                .with_min_level(level.to_level().unwrap_or(log::Level::Error))
+                .with_filter(
+                    android_logger::FilterBuilder::new()
+                        .parse("warn,gdk_rust=debug,gdk_electrum=debug")
+                        .build(),
+                ),
         )
     });
 
-    #[cfg(not(feature = "android_log"))]
+    #[cfg(not(target_os = "android"))]
     INIT_LOGGER.call_once(|| {
         log::set_logger(&LOGGER)
             .map(|()| log::set_max_level(level))
@@ -127,16 +118,14 @@ fn create_session(network: &Value) -> Result<GdkSession, Value> {
 
     let parsed_network = parsed_network.unwrap();
 
-    let db_root = network["state_dir"].as_str().unwrap_or("");
     let proxy = network["proxy"].as_str();
 
     match network["server_type"].as_str() {
         // Some("rpc") => GDKRUST_session::Rpc( GDKRPC_session::create_session(parsed_network.unwrap()).unwrap() ),
         Some("electrum") => {
-            let url = gdk_electrum::determine_electrum_url_from_net(&parsed_network)
-                .map_err(|x| json!(x))?;
+            let url = determine_electrum_url(&parsed_network).map_err(|x| json!(x))?;
 
-            let session = ElectrumSession::create_session(parsed_network, db_root, proxy, url);
+            let session = ElectrumSession::create_session(parsed_network, proxy, url);
             let backend = GdkBackend::Electrum(session);
 
             // some time in the past
@@ -227,11 +216,11 @@ pub extern "C" fn GDKRUST_call_session(
 
     info!("GDKRUST_call_session handle_call {} input {:?}", method, input_redacted);
     let res = match sess.backend {
-        GdkBackend::Electrum(ref mut s) => handle_call(s, &method, &input),
+        GdkBackend::Electrum(ref mut s) => handle_session_call(s, &method, &input),
         // GdkSession::Rpc(ref s) => handle_call(s, method),
     };
 
-    let methods_to_redact_out = vec!["get_mnemonic", "mnemonic_from_pin_data"];
+    let methods_to_redact_out = vec!["mnemonic_from_pin_data"];
     let mut output_redacted = if methods_to_redact_out.contains(&method.as_str()) {
         "redacted".to_string()
     } else {
@@ -243,16 +232,12 @@ pub extern "C" fn GDKRUST_call_session(
     let (s, ret) = match res {
         Ok(ref val) => (val.to_string(), GA_OK),
         Err(ref e) => {
-            let code = e.to_gdk_code();
-            let desc = e.gdk_display();
-
             let ret_val = match e {
-                Error::Electrum(gdk_electrum::error::Error::InvalidPin) => GA_NOT_AUTHORIZED,
+                Error::Electrum(ElectrumError::InvalidPin) => GA_NOT_AUTHORIZED,
                 _ => GA_ERROR,
             };
-
-            info!("rust error {}: {}", code, desc);
-            (json!({ "error": code, "message": desc }).to_string(), ret_val)
+            let json_error = build_error(&method, e);
+            (json_error, ret_val)
         }
     };
     let s = make_str(s);
@@ -275,7 +260,7 @@ pub extern "C" fn GDKRUST_set_notification_handler(
     let backend = &mut sess.backend;
 
     match backend {
-        GdkBackend::Electrum(ref mut s) => s.notify = NativeNotif(Some((handler, self_context))),
+        GdkBackend::Electrum(ref mut s) => s.notify.set_native((handler, self_context)),
     };
 
     info!("set notification handler");
@@ -284,10 +269,9 @@ pub extern "C" fn GDKRUST_set_notification_handler(
 }
 
 fn fetch_exchange_rates(agent: ureq::Agent) -> Vec<Ticker> {
-    if let Ok(result) =
-        agent.get("https://api-pub.bitfinex.com/v2/tickers?symbols=tBTCUSD").call().into_json()
+    if let Ok(result) = agent.get("https://api-pub.bitfinex.com/v2/tickers?symbols=tBTCUSD").call()
     {
-        if let Value::Array(array) = result {
+        if let Ok(Value::Array(array)) = result.into_json() {
             if let Some(Value::Array(array)) = array.get(0) {
                 // using BIDPRICE https://docs.bitfinex.com/reference#rest-public-tickers
                 if let Some(rate) = array.get(1).and_then(|e| e.as_f64()) {
@@ -317,11 +301,11 @@ fn tickers_to_json(tickers: Vec<Ticker>) -> Value {
 }
 
 // dynamic dispatch shenanigans
-fn handle_call<S, E>(session: &mut S, method: &str, input: &Value) -> Result<Value, Error>
-where
-    E: Into<Error>,
-    S: Session<E>,
-{
+fn handle_session_call(
+    session: &mut ElectrumSession,
+    method: &str,
+    input: &Value,
+) -> Result<Value, Error> {
     match method {
         "poll_session" => session.poll_session().map(|v| json!(v)).map_err(Into::into),
 
@@ -338,10 +322,26 @@ where
             .map(|v| json!(v))
             .map_err(Into::into),
 
+        "get_subaccount_nums" => {
+            session.get_subaccount_nums().map(|v| json!(v)).map_err(Into::into)
+        }
+
         "get_subaccounts" => session.get_subaccounts().map(|v| json!(v)).map_err(Into::into),
 
         "get_subaccount" => get_subaccount(session, input),
 
+        "discover_subaccount" => session
+            .discover_subaccount(serde_json::from_value(input.clone())?)
+            .map(|v| json!(v))
+            .map_err(Into::into),
+        "get_subaccount_root_path" => session
+            .get_subaccount_root_path(serde_json::from_value(input.clone())?)
+            .map(|v| json!(v))
+            .map_err(Into::into),
+        "get_subaccount_xpub" => session
+            .get_subaccount_xpub(serde_json::from_value(input.clone())?)
+            .map(|v| json!(v))
+            .map_err(Into::into),
         "create_subaccount" => {
             let opt: CreateAccountOpt = serde_json::from_value(input.clone())?;
             session.create_subaccount(opt).map(|v| json!(v)).map_err(Into::into)
@@ -371,7 +371,15 @@ where
             session.get_transactions(&opt).map(|x| txs_result_value(&x)).map_err(Into::into)
         }
 
-        "get_raw_transaction_details" => get_raw_transaction_details(session, input),
+        "get_transaction_hex" => {
+            get_transaction_hex(session, input).map(|v| json!(v)).map_err(Into::into)
+        }
+        "get_transaction_details" => session
+            .get_transaction_details(input.as_str().ok_or_else(|| {
+                Error::Other("get_transaction_details: input is not a string".into())
+            })?)
+            .map(|v| json!(v))
+            .map_err(Into::into),
         "get_balance" => session
             .get_balance(&serde_json::from_value(input.clone())?)
             .map(|v| json!(v))
@@ -404,10 +412,6 @@ where
             a
         }
 
-        "get_mnemonic" => {
-            session.get_mnemonic().map(|m| Value::String(m.get_mnemonic_str())).map_err(Into::into)
-        }
-
         "get_fee_estimates" => {
             session.get_fee_estimates().map_err(Into::into).and_then(|x| fee_estimate_values(&x))
         }
@@ -419,17 +423,34 @@ where
             .map(|v| json!(v))
             .map_err(Into::into),
 
-        "refresh_assets" => session
-            .refresh_assets(&serde_json::from_value(input.clone())?)
+        "refresh_assets" => gdk_registry::refresh_assets(&serde_json::from_value(input.clone())?)
             .map(|v| json!(v))
             .map_err(Into::into),
         "get_unspent_outputs" => session
             .get_unspent_outputs(&serde_json::from_value(input.clone())?)
             .map(|v| json!(v))
             .map_err(Into::into),
+        "load_store" => session
+            .load_store(&serde_json::from_value(input.clone())?)
+            .map(|v| json!(v))
+            .map_err(Into::into),
+        "get_master_blinding_key" => {
+            session.get_master_blinding_key().map_err(Into::into).map(|s| json!(s))
+        }
+        "set_master_blinding_key" => session
+            .set_master_blinding_key(&serde_json::from_value(input.clone())?)
+            .map(|v| json!(v))
+            .map_err(Into::into),
+        "start_threads" => session.start_threads().map_err(Into::into).map(|s| json!(s)),
+        "get_wallet_hash_id" => session.get_wallet_hash_id().map_err(Into::into).map(|s| json!(s)),
+
+        "remove_account" => session.remove_account().map_err(Into::into).map(|s| json!(s)),
 
         // "auth_handler_get_status" => Ok(auth_handler.to_json()),
-        _ => Err(Error::Other(format!("handle_call method not found: {}", method))),
+        _ => Err(Error::MethodNotFound {
+            method: method.to_string(),
+            in_session: true,
+        }),
     }
 }
 
@@ -449,34 +470,90 @@ pub extern "C" fn GDKRUST_destroy_session(ptr: *mut libc::c_void) {
     }
 }
 
+#[derive(serde::Serialize)]
+struct JsonError {
+    message: String,
+    error: String,
+}
+
+fn build_error(_method: &str, error: &Error) -> String {
+    let message = format!("{}", error.gdk_display());
+    let error = error.to_gdk_code();
+    let json_error = JsonError {
+        message,
+        error,
+    };
+    to_string(&json_error)
+}
+
+fn to_string<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(&value)
+        .expect("Default Serialize impl with maps containing only string keys")
+}
+
 #[no_mangle]
-pub extern "C" fn GDKRUST_spv_verify_tx(input: *const c_char) -> i32 {
-    init_logging(LevelFilter::Info);
-    info!("GDKRUST_spv_verify_tx");
-    let input: Value = match serde_json::from_str(&read_str(input)) {
-        Ok(x) => x,
-        Err(err) => {
-            error!("error: {:?}", err);
-            return GA_ERROR;
-        }
+pub extern "C" fn GDKRUST_call(
+    method: *const c_char,
+    input: *const c_char,
+    output: *mut *const c_char,
+) -> i32 {
+    let method = read_str(method);
+    let input = read_str(input);
+    debug!("GDKRUST_call {}", &method);
+
+    let (error_value, result) = match handle_call(&method, &input) {
+        Ok(value) => (GA_OK, value),
+        Err(err) => (GA_ERROR, build_error(&method, &err)),
     };
-    let input: SPVVerifyTx = match serde_json::from_value(input.clone()) {
-        Ok(val) => val,
-        Err(e) => {
-            warn!("{:?}", e);
-            return -1;
+
+    let result = make_str(result);
+    unsafe {
+        *output = result;
+    }
+    error_value
+}
+
+fn handle_call(method: &str, input: &str) -> Result<String, Error> {
+    match method {
+        "init" => {
+            let param: InitParam = serde_json::from_str(input)?;
+            init_logging(LevelFilter::from_str(&param.log_level).unwrap_or(LevelFilter::Off));
+            gdk_registry::init(&param.registry_dir)?;
+            // TODO: read more initialization params
+            Ok(to_string(&json!("".to_string())))
         }
-    };
-    match gdk_electrum::headers::spv_verify_tx(&input) {
-        Ok(res) => res.as_i32(),
-        Err(e) => {
-            warn!("{:?}", e);
-            -1
+        "psbt_extract_tx" => {
+            let param: ExtractTxParam = serde_json::from_str(input)?;
+            Ok(to_string(&pset::extract_tx(&param)?))
         }
+        "psbt_from_tx" => {
+            let param: FromTxParam = serde_json::from_str(input)?;
+            Ok(to_string(&pset::from_tx(&param)?))
+        }
+        "psbt_merge_tx" => {
+            let param: MergeTxParam = serde_json::from_str(input)?;
+            Ok(to_string(&pset::merge_tx(&param)?))
+        }
+        "spv_verify_tx" => {
+            let param: SPVVerifyTxParams = serde_json::from_str(input)?;
+            Ok(to_string(&headers::spv_verify_tx(&param)?.as_i32()))
+        }
+        "spv_download_headers" => {
+            let param: SPVDownloadHeadersParams = serde_json::from_str(input)?;
+            Ok(to_string(&headers::download_headers(&param)?))
+        }
+        "refresh_assets" => {
+            let param: gdk_registry::RefreshAssetsParam = serde_json::from_str(input)?;
+            Ok(to_string(&gdk_registry::refresh_assets(&param)?))
+        }
+        _ => Err(Error::MethodNotFound {
+            method: method.to_string(),
+            in_session: false,
+        }),
     }
 }
 
-#[cfg(not(feature = "android_log"))]
+#[cfg(not(target_os = "android"))]
 static LOGGER: SimpleLogger = SimpleLogger;
 
 pub struct SimpleLogger;

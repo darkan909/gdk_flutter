@@ -1,3 +1,4 @@
+use gdk_common::error::Error as CommonError;
 use gdk_common::model::ExchangeRateError;
 use gdk_electrum as electrum;
 
@@ -7,7 +8,12 @@ pub enum Error {
     JsonFrom(serde_json::Error),
     Electrum(electrum::error::Error),
     Rates(ExchangeRateError),
-    Common(gdk_common::error::Error),
+    Common(CommonError),
+    Registry(gdk_registry::Error),
+    MethodNotFound {
+        method: String,
+        in_session: bool,
+    },
 }
 
 impl Error {
@@ -31,6 +37,9 @@ impl Error {
             Error::Electrum(electrum::error::Error::InvalidAmount) => {
                 "id_invalid_amount".to_string()
             }
+            Error::Electrum(electrum::error::Error::InvalidAssetId) => {
+                "id_invalid_asset_id".to_string()
+            }
             Error::Electrum(electrum::error::Error::FeeRateBelowMinimum) => {
                 "id_fee_rate_is_below_minimum".to_string()
             }
@@ -47,6 +56,18 @@ impl Error {
             Error::Electrum(ref electrum) => format!("{}", electrum),
             Error::Rates(ref rates_err) => format!("{:?}", rates_err),
             Error::Common(ref err) => format!("{:?}", err),
+            Error::Registry(ref err) => format!("{:?}", err),
+            Error::MethodNotFound {
+                in_session,
+                method,
+            } => {
+                let s = if *in_session {
+                    "session"
+                } else {
+                    ""
+                };
+                format!("{} method not found: {:?}", s, method)
+            }
         }
     }
 }
@@ -72,5 +93,11 @@ impl From<ExchangeRateError> for Error {
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Error {
         Error::JsonFrom(e)
+    }
+}
+
+impl From<gdk_registry::Error> for Error {
+    fn from(e: gdk_registry::Error) -> Error {
+        Error::Registry(e)
     }
 }
