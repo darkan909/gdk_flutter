@@ -1,4 +1,4 @@
-mod bmeta;
+pub mod bmeta;
 
 fn main() {
     println!("Hello, world!");

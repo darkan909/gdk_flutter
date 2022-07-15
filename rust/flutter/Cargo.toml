@@ -1,0 +1,21 @@
+[package]
+name = "flutter"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+gdk-rust = { path = "../gdk_rust/" }
+gdk-electrum = { path = "../gdk_rust/gdk_electrum" }
+gdk-common = { path = "../gdk_rust/gdk_common" }
+anyhow = "*"
+bip39 = "1.0.1"
+rand = "0.6.5"
+serde_json = "1.0"
+
+[build-dependencies]
+prost-build = "0.6.1"
+vergen = { version = "5", default-features = false, features = ["build", "rustc", "git"] }

@@ -1,27 +1,17 @@
-use crate::be::{BEOutPoint, BEScript, BETransaction, BETransactionEntry, BETxid};
-use crate::util::{is_confidential_txoutsecrets, now, weight_to_vsize};
-use crate::NetworkId;
+use crate::be::{BEOutPoint, BEScript, BETransaction, BETransactionEntry, UTXOInfo, Utxos};
+use crate::util::StringSerialized;
 use bitcoin::Network;
-use elements::confidential;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::error::Error;
 use crate::scripts::ScriptType;
-use crate::wally::MasterBlindingKey;
-use bitcoin::hashes::hex::ToHex;
-use bitcoin::util::bip32::{ChildNumber, DerivationPath, ExtendedPubKey};
+use bitcoin::util::address::AddressType;
+use bitcoin::util::bip32::{ChildNumber, DerivationPath};
 use std::convert::TryFrom;
 use std::fmt;
 use std::fmt::Display;
-
-#[derive(Debug, Deserialize)]
-pub struct InitParam {
-    pub log_level: String,
-
-    #[serde(rename = "registrydir")]
-    pub registry_dir: String,
-}
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type Balances = HashMap<String, i64>;
 
@@ -132,7 +122,7 @@ pub struct CreateTransaction {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memo: Option<String>,
     #[serde(default)]
-    pub utxos: CreateTxUtxos,
+    pub utxos: GetUnspentOutputs,
     /// Minimum number of confirmations for coin selection
     #[serde(default)]
     pub num_confs: u32,
@@ -167,71 +157,16 @@ pub struct GetUnspentOpt {
     pub all_coins: Option<bool>, // unused
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct LoadStoreOpt {
-    pub master_xpub: ExtendedPubKey,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct GetMasterBlindingKeyResult {
-    /// Master blinding key, when encoded in json is an hex of 128 chars
-    ///
-    /// If the master blinding key is missing from the store,
-    /// it is None and the caller should set it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub master_blinding_key: Option<MasterBlindingKey>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct SetMasterBlindingKeyOpt {
-    /// Master blinding key, when encoded in json is an hex of 128 chars
-    pub master_blinding_key: MasterBlindingKey,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct GetAddressOpt {
     pub subaccount: u32,
     pub address_type: Option<String>, // unused
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CreateAccountOpt {
     pub subaccount: u32,
     pub name: String,
-    // The account xpub if passed by the caller
-    pub xpub: Option<ExtendedPubKey>,
-    #[serde(default)]
-    pub discovered: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct DiscoverAccountOpt {
-    #[serde(rename = "type")]
-    pub script_type: ScriptType,
-    pub xpub: ExtendedPubKey,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct GetAccountPathOpt {
-    pub subaccount: u32,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct GetAccountPathResult {
-    pub path: Vec<ChildNumber>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct GetAccountXpubOpt {
-    pub subaccount: u32,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct GetAccountXpubResult {
-    /// If the account xpub is missing from the store,
-    /// it is None and the caller should set it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub xpub: Option<ExtendedPubKey>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -247,57 +182,19 @@ pub struct RenameAccountOpt {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct SPVCommonParams {
-    /// In which network we are verifying the transaction
-    pub network: crate::network::NetworkParameters,
-
-    /// Maximum timeout for network calls,
-    /// the final timeout in seconds is roughly equivalent to 2 + `timeout` * 2
-    ///
-    /// Cannot be specified if `network.proxy` is non empty.
-    pub timeout: Option<u8>,
-
-    /// If callers are not handling a cache of the already verified tx, they can set this params to
-    /// to enable the cache in the callee side.
-    /// Encryption is needed to encrypt the cache content to avoid leaking the txids of the transactions
-    pub encryption_key: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct SPVVerifyTxParams {
-    #[serde(flatten)]
-    pub params: SPVCommonParams,
-
-    /// The `txid` of the transaction to verify
+pub struct SPVVerifyTx {
     pub txid: String,
-
-    /// The `height` of the block containing the transaction to be verified
     pub height: u32,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct SPVDownloadHeadersParams {
-    #[serde(flatten)]
-    pub params: SPVCommonParams,
-
-    /// Number of headers to download at every attempt, it defaults to 2016, useful to set lower
-    /// for testing
-    pub headers_to_download: Option<usize>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct SPVDownloadHeadersResult {
-    /// Current height tip of the headers downloaded
-    pub height: u32,
-
-    /// A reorg happened, any proof with height higher than this struct height must be considered
-    /// invalid
-    pub reorg: bool,
+    pub path: String,
+    pub network: crate::network::Network,
+    pub encryption_key: String,
+    pub tor_proxy: Option<String>,
+    pub headers_to_download: Option<usize>, // defaults to 2016, useful to set for testing
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
-pub enum SPVVerifyTxResult {
+pub enum SPVVerifyResult {
     Unconfirmed,
     InProgress,
     Verified,
@@ -329,27 +226,19 @@ pub struct TransactionMeta {
     pub changes_used: Option<u32>,
     pub rbf_optin: bool,
     pub user_signed: bool,
-    pub spv_verified: SPVVerifyTxResult,
+    pub spv_verified: SPVVerifyResult,
     #[serde(rename = "transaction_weight")]
     pub weight: usize,
     #[serde(rename = "transaction_vsize")]
     pub vsize: usize,
     #[serde(rename = "transaction_size")]
     pub size: usize,
-    // The utxos used in the transaction
-    #[serde(default)]
-    pub used_utxos: Vec<UnspentOutput>,
-    #[serde(rename = "transaction_version")]
-    pub version: u32,
-    #[serde(rename = "transaction_locktime")]
-    pub lock_time: u32,
-    pub transaction_outputs: Vec<TransactionOutput>,
 }
 
 impl From<BETransaction> for TransactionMeta {
     fn from(transaction: BETransaction) -> Self {
         let txid = transaction.txid().to_string();
-        let hex = transaction.serialize().to_hex();
+        let hex = hex::encode(&transaction.serialize());
         let timestamp = now();
         let rbf_optin = transaction.rbf_optin();
         let weight = transaction.get_weight();
@@ -370,25 +259,18 @@ impl From<BETransaction> for TransactionMeta {
             type_: "unknown".to_string(),
             changes_used: None,
             user_signed: false,
-            spv_verified: SPVVerifyTxResult::InProgress,
+            spv_verified: SPVVerifyResult::InProgress,
             rbf_optin,
             weight,
-            vsize: weight_to_vsize(weight),
+            vsize: (weight as f32 / 4.0) as usize,
             size: transaction.get_size(),
-            used_utxos: vec![],
-            version: transaction.version(),
-            lock_time: transaction.lock_time(),
-            transaction_outputs: vec![],
         }
     }
 }
 impl From<BETransactionEntry> for TransactionMeta {
     fn from(txe: BETransactionEntry) -> Self {
         let mut txm: TransactionMeta = txe.tx.into();
-        // Overwrite with correct (v)size and weight
-        // (i.e. the ones before stripping the witness)
         txm.weight = txe.weight;
-        txm.vsize = weight_to_vsize(txe.weight);
         txm.size = txe.size;
         txm
     }
@@ -405,7 +287,7 @@ impl TransactionMeta {
         type_: String,
         create_transaction: CreateTransaction,
         user_signed: bool,
-        spv_verified: SPVVerifyTxResult,
+        spv_verified: SPVVerifyResult,
     ) -> Self {
         let mut wgtx: TransactionMeta = transaction.into();
         let timestamp = timestamp.unwrap_or_else(now);
@@ -424,134 +306,43 @@ impl TransactionMeta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TransactionOutput {
-    pub address: String, // Only used by Trezor
-    pub address_type: String,
-
-    /// True if the corresponding scriptpubkey belongs to the account (not the wallet)
-    pub is_relevant: bool,
-
-    pub subaccount: u32,
-    pub is_internal: bool,
-    pub is_change: bool, // Same as is_internal
-    pub pointer: u32,    // child_number in bip32 terminology
-    pub user_path: Vec<ChildNumber>,
-
-    pub pt_idx: u32, // vout
-    #[serde(rename = "script")]
-    pub script_pubkey: String,
-    pub satoshi: u64,
-}
-
-/// Input and output element for get_transactions
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetTxInOut {
-    /// The address of the input or output.
-    ///
-    /// For Liquid is always unblinded.
-    ///
-    /// For not relevant Liquid inputs it might be empty,
-    /// because we don't need to fecth previous transaction for the fee computation.
+pub struct AddressIO {
     pub address: String,
-
-    /// The address type of the element.
-    ///
-    /// Empty if the element is not relevant.
-    // TODO: use an enum and sort out AddressType/ScriptType
-    pub address_type: String,
-
-    /// Always empty for now.
+    pub address_type: StringSerialized<AddressType>,
     pub addressee: String,
-
-    /// Whether the elements is an input or an output.
     pub is_output: bool,
-
-    /// Whether the corresponding scriptpubkey belongs to the account (not the wallet).
+    // True if the corresponding scriptpubkey belongs to the account (not the wallet)
     pub is_relevant: bool,
-
-    /// Whether the element is spent.
-    ///
-    /// For outputs the computation is expensive and might require additional network calls,
-    /// thus for now it is always false.
     pub is_spent: bool,
-
-    /// The subaccount the element belongs to.
-    ///
-    /// 0 if not relevant.
-    pub subaccount: u32,
-
-    /// Whether the element belongs to the internal chain.
-    ///
-    /// False if not relevant.
-    pub is_internal: bool,
-
-    /// Child number in bip32 terminology.
-    ///
-    /// 0 if not relevant.
-    pub pointer: u32,
-
-    /// If output the vout, if input the vin.
-    pub pt_idx: u32,
-
-    /// The amount associated to the element.
-    ///
-    /// For liquid is 0 if the amount cannot be unblinded.
+    pub pointer: u32, // child_number in bip32 terminology
+    pub pt_idx: u32,  // vout
     pub satoshi: u64,
-
-    /// Multisig field, always 0.
+    pub asset_id: String,
+    pub assetblinder: String,
+    pub amountblinder: String,
     pub script_type: u32,
-
-    /// Multisig field, always 0.
-    pub subtype: u32,
-
-    // Liquid fields
-    /// The asset id.
-    ///
-    /// None if not liquid or not unblindable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub asset_id: Option<String>,
-
-    /// The asset blinder (aka asset blinding factor or abf).
-    ///
-    /// None if not liquid or not unblindable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "assetblinder")]
-    pub asset_blinder: Option<String>,
-
-    /// The amount blinder (aka value blinding factor or vbf).
-    ///
-    /// None if not liquid or not unblindable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "amountblinder")]
-    pub amount_blinder: Option<String>,
+    pub subaccount: u32,
+    pub subtype: u32, // unused here, but used in gdk interface for CSV bucketing
 }
 
-/// Transaction type
-///
-/// Note that the follwing types might be inaccurate for complex
-/// transactions such as swaps, coinjoins or involving multiple (sub)accounts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TransactionType {
-    Unknown,
-    Incoming,
-    Outgoing,
-    Redeposit,
-    #[serde(rename = "not unblindable")]
-    NotUnblindable,
-}
-
-impl Default for TransactionType {
+impl Default for AddressIO {
     fn default() -> Self {
-        Self::Unknown
-    }
-}
-
-impl TransactionType {
-    pub fn user_signed(&self) -> bool {
-        match self {
-            TransactionType::Outgoing | TransactionType::Redeposit => true,
-            _ => false,
+        AddressIO {
+            address: "".into(),
+            address_type: bitcoin::util::address::AddressType::P2sh.into(),
+            addressee: "".into(),
+            asset_id: "".into(),
+            is_output: false,
+            is_relevant: false,
+            is_spent: false,
+            pointer: 0,
+            pt_idx: 0,
+            satoshi: 0,
+            script_type: 0,
+            subaccount: 0,
+            subtype: 0,
+            assetblinder: "".into(),
+            amountblinder: "".into(),
         }
     }
 }
@@ -562,22 +353,27 @@ pub struct TxListItem {
     pub block_height: u32,
     pub created_at_ts: u64, // in microseconds
     #[serde(rename = "type")]
-    pub type_: TransactionType,
+    pub type_: String,
     pub memo: String,
     pub txhash: String,
+    pub transaction: String,
     #[serde(serialize_with = "serialize_tx_balances")]
     pub satoshi: Balances,
     pub rbf_optin: bool,
     pub can_cpfp: bool,
     pub can_rbf: bool,
+    #[serde(skip)]
+    pub has_payment_request: bool,
     pub server_signed: bool,
     pub user_signed: bool,
+    #[serde(skip)]
+    pub instant: bool,
     pub spv_verified: String,
     pub fee: u64,
     pub fee_rate: u64,
     pub addressees: Vec<String>, // receiver's addresses
-    pub inputs: Vec<GetTxInOut>,
-    pub outputs: Vec<GetTxInOut>,
+    pub inputs: Vec<AddressIO>,  // tx.input.iter().map(format_gdk_input).collect(),
+    pub outputs: Vec<AddressIO>, //tx.output.iter().map(format_gdk_output).collect(),
     pub transaction_size: usize,
     pub transaction_vsize: usize,
     pub transaction_weight: usize,
@@ -607,7 +403,6 @@ pub struct AccountInfo {
     pub settings: AccountSettings,
     pub required_ca: u32,     // unused, always 0
     pub receiving_id: String, // unused, always ""
-    pub bip44_discovered: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -628,7 +423,6 @@ pub struct PinGetDetails {
 pub struct AddressPointer {
     pub address: String,
     pub pointer: u32, // child_number in bip32 terminology
-    pub user_path: Vec<ChildNumber>,
 }
 
 // This one is simple enough to derive a serializer
@@ -689,6 +483,35 @@ pub struct SetAccountHiddenOpt {
     pub hidden: bool,
 }
 
+/// {"icons":true,"assets":false,"refresh":false}
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct RefreshAssets {
+    pub icons: bool,
+    pub assets: bool,
+    pub refresh: bool,
+}
+
+impl Default for RefreshAssets {
+    fn default() -> Self {
+        Self {
+            icons: false,
+            assets: false,
+            refresh: true,
+        }
+    }
+}
+
+impl RefreshAssets {
+    pub fn new(icons: bool, assets: bool, refresh: bool) -> Self {
+        RefreshAssets {
+            icons,
+            assets,
+            refresh,
+        }
+    }
+}
+
 /// see comment for struct Settings
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct Pricing {
@@ -712,91 +535,36 @@ impl Default for Settings {
     }
 }
 
-impl SPVVerifyTxResult {
+fn now() -> u64 {
+    let start = SystemTime::now();
+    let since_the_epoch = start.duration_since(UNIX_EPOCH).expect("Time went backwards");
+    // Realistic timestamps can be converted to u64
+    u64::try_from(since_the_epoch.as_micros()).unwrap_or(u64::MAX)
+}
+
+impl SPVVerifyResult {
     pub fn as_i32(&self) -> i32 {
         match self {
-            SPVVerifyTxResult::InProgress => 0,
-            SPVVerifyTxResult::Verified => 1,
-            SPVVerifyTxResult::NotVerified => 2,
-            SPVVerifyTxResult::Disabled => 3,
-            SPVVerifyTxResult::NotLongest => 4,
-            SPVVerifyTxResult::Unconfirmed => 5,
+            SPVVerifyResult::InProgress => 0,
+            SPVVerifyResult::Verified => 1,
+            SPVVerifyResult::NotVerified => 2,
+            SPVVerifyResult::Disabled => 3,
+            SPVVerifyResult::NotLongest => 4,
+            SPVVerifyResult::Unconfirmed => 5,
         }
     }
 }
 
-impl Display for SPVVerifyTxResult {
+impl Display for SPVVerifyResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SPVVerifyTxResult::InProgress => write!(f, "in_progress"),
-            SPVVerifyTxResult::Verified => write!(f, "verified"),
-            SPVVerifyTxResult::NotVerified => write!(f, "not_verified"),
-            SPVVerifyTxResult::Disabled => write!(f, "disabled"),
-            SPVVerifyTxResult::NotLongest => write!(f, "not_longest"),
-            SPVVerifyTxResult::Unconfirmed => write!(f, "unconfirmed"),
+            SPVVerifyResult::InProgress => write!(f, "in_progress"),
+            SPVVerifyResult::Verified => write!(f, "verified"),
+            SPVVerifyResult::NotVerified => write!(f, "not_verified"),
+            SPVVerifyResult::Disabled => write!(f, "disabled"),
+            SPVVerifyResult::NotLongest => write!(f, "not_longest"),
+            SPVVerifyResult::Unconfirmed => write!(f, "unconfirmed"),
         }
-    }
-}
-
-// In create_transaction, the caller passes the utxos in the same format as they are returned by
-// get_unspent_output, but we only care about the outpoint, since we can obtain the remaining data
-// from the db.
-// CreateTxUtxo and CreateTxUtxos allows us to accept the serialized GetUnspentOutputs, ignoring
-// the fields we are not interested in.
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CreateTxUtxo {
-    #[serde(rename = "txhash")]
-    pub txid: String,
-    #[serde(rename = "pt_idx")]
-    pub vout: u32,
-}
-
-pub type CreateTxUtxos = HashMap<String, Vec<CreateTxUtxo>>;
-
-impl CreateTxUtxo {
-    pub fn outpoint(&self, id: NetworkId) -> Result<BEOutPoint, Error> {
-        let betxid = BETxid::from_hex(&self.txid, id)?;
-        Ok(BEOutPoint::new(betxid, self.vout))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Txo {
-    pub outpoint: BEOutPoint,
-
-    pub height: Option<u32>,
-
-    pub public_key: bitcoin::PublicKey,
-    pub script_pubkey: BEScript,
-    pub script_code: BEScript,
-
-    pub subaccount: u32,
-    pub script_type: ScriptType,
-
-    /// The full path from the master key
-    pub user_path: Vec<ChildNumber>,
-
-    pub satoshi: u64,
-
-    pub sequence: Option<u32>,
-
-    /// The Liquid commitment preimages (asset, satoshi and blinders)
-    pub txoutsecrets: Option<elements::TxOutSecrets>,
-    /// The Liquid commitments
-    pub txoutcommitments: Option<(confidential::Asset, confidential::Value, confidential::Nonce)>,
-}
-
-impl Txo {
-    pub fn confidential(&self) -> Option<bool> {
-        self.txoutsecrets.as_ref().map(is_confidential_txoutsecrets)
-    }
-
-    pub fn is_confidential(&self) -> bool {
-        self.confidential().unwrap_or(false)
-    }
-
-    pub fn asset_id(&self) -> Option<elements::issuance::AssetId> {
-        self.txoutsecrets.as_ref().map(|s| s.asset.clone())
     }
 }
 
@@ -811,153 +579,94 @@ pub struct UnspentOutput {
     pub pt_idx: u32,
     pub satoshi: u64,
     pub subaccount: u32,
-    pub is_segwit: bool,
     pub txhash: String,
     /// `true` iff belongs to internal chain, i.e. is change
     pub is_internal: bool,
-    pub user_path: Vec<ChildNumber>,
+    pub confidential: bool,
+    #[serde(skip)]
+    pub derivation_path: DerivationPath,
     #[serde(skip)]
     pub scriptpubkey: BEScript,
-    /// This can be Some only when this describes an input
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sequence: Option<u32>,
-    #[serde(rename = "prevout_script")]
-    pub script_code: String,
-    pub public_key: String,
-
-    // liquid fields
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub confidential: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub asset_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "assetblinder")]
-    pub asset_blinder: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "amountblinder")]
-    pub amount_blinder: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "asset_tag")]
-    pub asset_commitment: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "commitment")]
-    pub value_commitment: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nonce_commitment: Option<String>,
 }
 
-impl TryFrom<Txo> for UnspentOutput {
-    type Error = Error;
-
-    fn try_from(txo: Txo) -> Result<Self, Error> {
-        let (is_internal, pointer) = parse_path(&txo.user_path.clone().into())?;
-        let asset_id = txo.txoutsecrets.as_ref().map(|s| s.asset.to_hex());
-        let confidential = txo.confidential();
-        let asset_blinder = txo.txoutsecrets.as_ref().map(|s| s.asset_bf.to_hex());
-        let amount_blinder = txo.txoutsecrets.as_ref().map(|s| s.value_bf.to_hex());
-        let (asset_commitment, value_commitment, nonce_commitment) = match &txo.txoutcommitments {
-            None => (None, None, None),
-            Some((a, v, n)) => (
-                Some(elements::encode::serialize_hex(a)),
-                Some(elements::encode::serialize_hex(v)),
-                Some(elements::encode::serialize_hex(n)),
-            ),
+impl UnspentOutput {
+    pub fn new(outpoint: &BEOutPoint, info: &UTXOInfo) -> Self {
+        let mut unspent_output = UnspentOutput::default();
+        unspent_output.address_type = "p2shwpkh".to_string();
+        unspent_output.satoshi = info.value;
+        unspent_output.txhash = format!("{}", outpoint.txid());
+        unspent_output.pt_idx = outpoint.vout();
+        unspent_output.derivation_path = info.path.clone();
+        unspent_output.scriptpubkey = info.script.clone();
+        unspent_output.confidential = info.confidential;
+        let mut iter = info.path.into_iter().rev();
+        if let Some(&ChildNumber::Normal {
+            index,
+        }) = iter.next()
+        {
+            // last
+            unspent_output.pointer = index;
         };
-        Ok(Self {
-            txhash: txo.outpoint.txid().to_hex(),
-            pt_idx: txo.outpoint.vout(),
-            block_height: txo.height.unwrap_or(0),
-            public_key: txo.public_key.to_string(),
-            scriptpubkey: txo.script_pubkey,
-            script_code: txo.script_code.to_hex(),
-            subaccount: txo.subaccount,
-            is_segwit: txo.script_type.is_segwit(),
-            address_type: txo.script_type.to_string(),
-            user_path: txo.user_path,
-            is_internal,
-            pointer,
-            satoshi: txo.satoshi,
-            sequence: txo.sequence,
-            confidential,
-            asset_id,
-            asset_blinder,
-            amount_blinder,
-            asset_commitment,
-            value_commitment,
-            nonce_commitment,
-        })
+        if let Some(&ChildNumber::Normal {
+            index,
+        }) = iter.next()
+        {
+            // second-to-last
+            unspent_output.is_internal = index == 1;
+        };
+        unspent_output.block_height = info.height.unwrap_or(0);
+        unspent_output
     }
 }
 
-/// Partially parse the derivation path and return (is_internal, address_pointer)
-pub fn parse_path(path: &DerivationPath) -> Result<(bool, u32), Error> {
-    let address_pointer;
-    let is_internal;
-    let mut iter = path.into_iter().rev();
-    if let Some(&ChildNumber::Normal {
-        index,
-    }) = iter.next()
-    {
-        // last
-        address_pointer = index;
-    } else {
-        return Err(Error::Generic("Unexpected derivation path".into()));
-    };
-    if let Some(&ChildNumber::Normal {
-        index,
-    }) = iter.next()
-    {
-        // second-to-last
-        is_internal = index == 1;
-    } else {
-        return Err(Error::Generic("Unexpected derivation path".into()));
-    };
-    Ok((is_internal, address_pointer))
-}
+impl TryFrom<&GetUnspentOutputs> for Utxos {
+    type Error = Error;
 
-// Output of get_transaction_details
-#[derive(Serialize, Debug, Clone)]
-pub struct TransactionDetails {
-    pub transaction: String,
-    pub txhash: String,
-    pub transaction_locktime: u32,
-    pub transaction_version: u32,
-    pub transaction_size: usize,
-    pub transaction_vsize: usize,
-    pub transaction_weight: usize,
-}
-
-impl From<&BETransactionEntry> for TransactionDetails {
-    fn from(tx_entry: &BETransactionEntry) -> Self {
-        Self {
-            transaction: tx_entry.tx.serialize().to_hex(),
-            txhash: tx_entry.tx.txid().to_string(),
-            transaction_locktime: tx_entry.tx.lock_time(),
-            transaction_version: tx_entry.tx.version(),
-            transaction_size: tx_entry.size,
-            transaction_vsize: weight_to_vsize(tx_entry.weight),
-            transaction_weight: tx_entry.weight,
+    fn try_from(unspent_outputs: &GetUnspentOutputs) -> Result<Self, Error> {
+        let mut utxos = vec![];
+        for (asset, v) in unspent_outputs.0.iter() {
+            for e in v {
+                let height = match e.block_height {
+                    0 => None,
+                    n => Some(n),
+                };
+                let (outpoint, utxo_info) = match &asset[..] {
+                    "btc" => (
+                        BEOutPoint::new_bitcoin(e.txhash.parse()?, e.pt_idx),
+                        UTXOInfo::new_bitcoin(
+                            e.satoshi,
+                            e.scriptpubkey.clone().into(),
+                            height,
+                            e.derivation_path.clone(),
+                        ),
+                    ),
+                    _ => (
+                        BEOutPoint::new_elements(e.txhash.parse()?, e.pt_idx),
+                        UTXOInfo::new_elements(
+                            asset.parse()?,
+                            e.satoshi,
+                            e.scriptpubkey.clone().into(),
+                            height,
+                            e.derivation_path.clone(),
+                            e.confidential,
+                        ),
+                    ),
+                };
+                utxos.push((outpoint, utxo_info));
+            }
         }
+        Ok(utxos)
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::model::{parse_path, CreateTxUtxos, GetUnspentOutputs};
-    use bitcoin::util::bip32::DerivationPath;
-
-    #[test]
-    fn test_path() {
-        let path_external: DerivationPath = "m/44'/1'/0'/0/0".parse().unwrap();
-        let path_internal: DerivationPath = "m/44'/1'/0'/1/0".parse().unwrap();
-        assert_eq!(parse_path(&path_external).unwrap(), (false, 0u32));
-        assert_eq!(parse_path(&path_internal).unwrap(), (true, 0u32));
-    }
+    use crate::model::GetUnspentOutputs;
 
     #[test]
     fn test_unspent() {
-        let json_str = r#"{"btc": [{"address_type": "p2wsh", "block_height": 1806588, "pointer": 3509, "pt_idx": 1, "satoshi": 3650144, "subaccount": 0, "txhash": "08711d45d4867d7834b133a425da065b252eb6a9b206d57e2bbb226a344c5d13", "is_internal": false, "confidential": false, "user_path": [2147483692, 2147483649, 2147483648, 0, 1], "prevout_script": "51", "is_segwit": true, "public_key": "020202020202020202020202020202020202020202020202020202020202020202", "asset_id": ""}, {"address_type": "p2wsh", "block_height": 1835681, "pointer": 3510, "pt_idx": 0, "satoshi": 5589415, "subaccount": 0, "txhash": "fbd00e5b9e8152c04214c72c791a78a65fdbab68b5c6164ff0d8b22a006c5221", "is_internal": false, "confidential": false, "user_path": [2147483692, 2147483649, 2147483648, 0, 2], "prevout_script": "51", "is_segwit": true, "public_key": "020202020202020202020202020202020202020202020202020202020202020202", "asset_id": ""}, {"address_type": "p2wsh", "block_height": 1835821, "pointer": 3511, "pt_idx": 0, "satoshi": 568158, "subaccount": 0, "txhash": "e5b358fb8366960130b97794062718d7f4fbe721bf274f47493a19326099b811", "is_internal": false, "confidential": false, "user_path": [2147483692, 2147483649, 2147483648, 0, 3], "prevout_script": "51", "is_segwit": true, "public_key": "020202020202020202020202020202020202020202020202020202020202020202", "asset_id": ""}]}"#;
-        let _json: GetUnspentOutputs = serde_json::from_str(json_str).unwrap();
-        let _json: CreateTxUtxos = serde_json::from_str(json_str).unwrap();
+        let json_str = r#"{"btc": [{"address_type": "p2wsh", "block_height": 1806588, "pointer": 3509, "pt_idx": 1, "satoshi": 3650144, "subaccount": 0, "txhash": "08711d45d4867d7834b133a425da065b252eb6a9b206d57e2bbb226a344c5d13", "is_internal": false, "confidential": false}, {"address_type": "p2wsh", "block_height": 1835681, "pointer": 3510, "pt_idx": 0, "satoshi": 5589415, "subaccount": 0, "txhash": "fbd00e5b9e8152c04214c72c791a78a65fdbab68b5c6164ff0d8b22a006c5221", "is_internal": false, "confidential": false}, {"address_type": "p2wsh", "block_height": 1835821, "pointer": 3511, "pt_idx": 0, "satoshi": 568158, "subaccount": 0, "txhash": "e5b358fb8366960130b97794062718d7f4fbe721bf274f47493a19326099b811", "is_internal": false, "confidential": false}]}"#;
+        let json: GetUnspentOutputs = serde_json::from_str(json_str).unwrap();
+        println!("{:#?}", json);
     }
 }

@@ -1,7 +1,6 @@
 use std::fmt;
 
 // This doesn't do validation, but we could?
-#[derive(Clone)]
 pub struct Password(String);
 
 impl Password {

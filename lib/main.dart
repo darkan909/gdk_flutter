@@ -7,13 +7,14 @@ import 'dart:convert';
 void main() {
   print("belllal");
   runApp(const MyApp());
-  Pointer<gdk.GA_json> config;
+  final f = Pointer<gdk.GA_json>;
+  print(f);
   //config = '{"name":"electrum-liquid"}';
   //print(jsonDecode(cc));
   //config = jsonDecode(cc) as Pointer<gdk.GA_json>;
   // ignore: unused_local_variable
-  int c(gdk.GdkLibrary g) => g.GA_init(config);
-  print(c);
+  int c(gdk.GdkLibrary g) => g.GA_init(f);
+  //print(c);
   print("uagliooooooo");
 }
 

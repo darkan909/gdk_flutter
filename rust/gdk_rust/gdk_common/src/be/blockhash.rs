@@ -14,13 +14,6 @@ impl BEBlockHash {
             Self::Elements(blockhash) => blockhash.to_hex(),
         }
     }
-
-    pub fn into_bitcoin(&self) -> bitcoin::BlockHash {
-        match self {
-            Self::Bitcoin(h) => *h,
-            Self::Elements(h) => bitcoin::BlockHash::from_hash(h.as_hash()),
-        }
-    }
 }
 
 impl ToString for BEBlockHash {

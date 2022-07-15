@@ -1,13 +1,9 @@
 use crate::store::StoreMeta;
-use crate::{Account, BEOutPoint, BETxid, State};
 use aes_gcm_siv::aead;
-use bitcoin::util::bip32::ExtendedPubKey;
-use gdk_common::error::Error as CommonError;
 use serde::ser::Serialize;
-use std::collections::{HashMap, HashSet};
 use std::convert::From;
 use std::fmt::Display;
-use std::sync::{MutexGuard, PoisonError, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{PoisonError, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Debug)]
 pub enum Error {
@@ -16,7 +12,6 @@ pub enum Error {
     InvalidMnemonic,
     InsufficientFunds,
     InvalidAddress,
-    InvalidAssetId,
     NonConfidentialAddress,
     InvalidAmount,
     EmptyAddressees,
@@ -32,13 +27,6 @@ pub enum Error {
     /// consecutive wrong guesses the server will delete the corresponding key. Other errors should
     /// leave such counter unchanged.
     InvalidPin,
-    PsetAndTxMismatch,
-    StoreNotLoaded,
-    WalletNotInitialized,
-    MissingMasterBlindingKey,
-    TxNotFound(BETxid),
-    ScriptPubkeyNotFound,
-    MismatchingXpubs(ExtendedPubKey, ExtendedPubKey),
     AddrParse(String),
     InvalidElectrumUrl(String),
     Bitcoin(bitcoin::util::Error),
@@ -47,13 +35,14 @@ pub enum Error {
     BitcoinConsensus(bitcoin::consensus::encode::Error),
     JSON(serde_json::error::Error),
     StdIOError(std::io::Error),
+    Hex(hex::FromHexError),
     ClientError(electrum_client::Error),
     SliceConversionError(std::array::TryFromSliceError),
     ElementsEncode(elements::encode::Error),
     ElementsPset(elements::pset::Error),
     PsetBlindError(elements::pset::PsetBlindError),
     UnblindError(elements::UnblindError),
-    Common(CommonError),
+    Common(gdk_common::error::Error),
     Send(std::sync::mpsc::SendError<()>),
     Encryption(block_modes::BlockModeError),
     Secp256k1(bitcoin::secp256k1::Error),
@@ -69,7 +58,6 @@ impl Display for Error {
             Error::InsufficientFunds => write!(f, "insufficient funds"),
             Error::SendAll => write!(f, "sendall error"),
             Error::InvalidAddress => write!(f, "invalid address"),
-            Error::InvalidAssetId => write!(f, "invalid asset id"),
             Error::NonConfidentialAddress => write!(f, "non confidential address"),
             Error::InvalidAmount => write!(f, "invalid amount"),
             Error::InvalidHeaders => write!(f, "invalid headers"),
@@ -82,21 +70,13 @@ impl Display for Error {
             }
             Error::InvalidReplacementRequest => write!(f, "invalid replacement request fields"),
             Error::UnknownCall => write!(f, "unknown call"),
-            Error::StoreNotLoaded => {
-                write!(f, "attempt to access the store without calling load_store first")
-            }
-            Error::MissingMasterBlindingKey => {
-                write!(f, "Master blinding key is missing but we need it")
-            }
-            Error::WalletNotInitialized => {
-                write!(f, "Wallet is not initialized")
-            }
             Error::Bitcoin(ref btcerr) => write!(f, "bitcoin: {}", btcerr),
             Error::BitcoinHashes(ref btcerr) => write!(f, "bitcoin_hashes: {}", btcerr),
             Error::BitcoinBIP32Error(ref bip32err) => write!(f, "bip32: {}", bip32err),
             Error::BitcoinConsensus(ref consensus_err) => write!(f, "consensus: {}", consensus_err),
             Error::JSON(ref json_err) => write!(f, "json: {}", json_err),
             Error::StdIOError(ref io_err) => write!(f, "io: {}", io_err),
+            Error::Hex(ref hex_err) => write!(f, "hex: {}", hex_err),
             Error::ClientError(ref client_err) => write!(f, "client: {:?}", client_err),
             Error::SliceConversionError(ref slice_err) => write!(f, "slice: {}", slice_err),
             Error::ElementsEncode(ref el_err) => write!(f, "el_err: {}", el_err),
@@ -108,15 +88,9 @@ impl Display for Error {
             Error::Encryption(ref send_err) => write!(f, "encryption_err: {:?}", send_err),
             Error::Secp256k1(ref err) => write!(f, "Secp256k1_err: {:?}", err),
             Error::Secp256k1Zkp(ref err) => write!(f, "Secp256k1_zkp_err: {:?}", err),
-            Error::PinError => write!(f, "id_connection_failed"),
+            Error::PinError => write!(f, "PinError"),
             Error::InvalidPin => write!(f, "id_invalid_pin"),
             Error::InvalidElectrumUrl(url) => write!(f, "Invalid Electrum URL: {}", url),
-            Error::PsetAndTxMismatch => write!(f, "PSET and Tx mismatch"),
-            Error::TxNotFound(txid) => write!(f, "Transaction not found ({})", txid),
-            Error::ScriptPubkeyNotFound => write!(f, "Scriptpubkey not found"),
-            Error::MismatchingXpubs(xpub1, xpub2) => {
-                write!(f, "Xpubs mismatch ({}, {})", xpub1, xpub2)
-            }
         }
     }
 }
@@ -176,6 +150,12 @@ impl From<bitcoin::consensus::encode::Error> for Error {
     }
 }
 
+impl From<hex::FromHexError> for Error {
+    fn from(err: hex::FromHexError) -> Self {
+        Error::Hex(err)
+    }
+}
+
 impl From<electrum_client::Error> for Error {
     fn from(err: electrum_client::Error) -> Self {
         Error::ClientError(err)
@@ -211,8 +191,8 @@ impl From<elements::UnblindError> for Error {
     }
 }
 
-impl From<CommonError> for Error {
-    fn from(err: CommonError) -> Self {
+impl From<gdk_common::error::Error> for Error {
+    fn from(err: gdk_common::error::Error) -> Self {
         Error::Common(err)
     }
 }
@@ -279,48 +259,6 @@ impl From<PoisonError<RwLockReadGuard<'_, StoreMeta>>> for Error {
 
 impl From<PoisonError<RwLockWriteGuard<'_, StoreMeta>>> for Error {
     fn from(err: PoisonError<RwLockWriteGuard<'_, StoreMeta>>) -> Self {
-        Error::Generic(err.to_string())
-    }
-}
-
-impl From<PoisonError<RwLockReadGuard<'_, State>>> for Error {
-    fn from(err: PoisonError<RwLockReadGuard<'_, State>>) -> Self {
-        Error::Generic(err.to_string())
-    }
-}
-
-impl From<PoisonError<RwLockWriteGuard<'_, State>>> for Error {
-    fn from(err: PoisonError<RwLockWriteGuard<'_, State>>) -> Self {
-        Error::Generic(err.to_string())
-    }
-}
-
-impl From<PoisonError<RwLockReadGuard<'_, HashMap<u32, Account>>>> for Error {
-    fn from(err: PoisonError<RwLockReadGuard<'_, HashMap<u32, Account>>>) -> Self {
-        Error::Generic(err.to_string())
-    }
-}
-
-impl From<PoisonError<RwLockWriteGuard<'_, HashMap<u32, Account>>>> for Error {
-    fn from(err: PoisonError<RwLockWriteGuard<'_, HashMap<u32, Account>>>) -> Self {
-        Error::Generic(err.to_string())
-    }
-}
-
-impl From<PoisonError<RwLockReadGuard<'_, HashSet<BEOutPoint>>>> for Error {
-    fn from(err: PoisonError<RwLockReadGuard<'_, HashSet<BEOutPoint>>>) -> Self {
-        Error::Generic(err.to_string())
-    }
-}
-
-impl From<PoisonError<RwLockWriteGuard<'_, HashSet<BEOutPoint>>>> for Error {
-    fn from(err: PoisonError<RwLockWriteGuard<'_, HashSet<BEOutPoint>>>) -> Self {
-        Error::Generic(err.to_string())
-    }
-}
-
-impl From<PoisonError<MutexGuard<'_, ()>>> for Error {
-    fn from(err: PoisonError<MutexGuard<'_, ()>>) -> Self {
         Error::Generic(err.to_string())
     }
 }
