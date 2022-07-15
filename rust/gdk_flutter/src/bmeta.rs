@@ -10,7 +10,8 @@ use  std::ffi;
 use gdk_electrum::interface::ElectrumUrl;
 use std::fmt::Debug;
 use gdk_common::session::Session;
-pub use flutter::worker;
+use flutter::worker;
+//extern crate flutter;
 
 pub const GA_ERROR: i32 = -1;
 
@@ -28,7 +29,7 @@ pub fn init() {
     //let c = "";
     //bip39_mnemonic_to_seed(&mne, &c);
     return Ok(session);*/
-    let c = unsafe { worker::init()};
+    let c = worker::init();
 }
 
 fn generate_mnemonic12_from_rng<R: rand::RngCore + rand::CryptoRng>(rng: &mut R) -> String {
